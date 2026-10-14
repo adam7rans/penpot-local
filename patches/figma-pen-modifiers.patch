@@ -1,0 +1,451 @@
+diff --git a/frontend/resources/images/cursors/bend.svg b/frontend/resources/images/cursors/bend.svg
+new file mode 100644
+index 0000000..89015c1
+--- /dev/null
++++ b/frontend/resources/images/cursors/bend.svg
+@@ -0,0 +1,8 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">
++  <path d="M2.5 12.5C2.5 7.5 7.5 2.5 12.5 2.5" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
++  <path d="M2.5 12.5C2.5 7.5 7.5 2.5 12.5 2.5" stroke="#000" stroke-width="1.5" stroke-linecap="round" fill="none"/>
++  <circle cx="2.5" cy="12.5" r="2.2" fill="#fff" stroke="#000" stroke-width="1.2"/>
++  <circle cx="12.5" cy="2.5" r="2.2" fill="#fff" stroke="#000" stroke-width="1.2"/>
++  <circle cx="2.5" cy="12.5" r="0.8" fill="#000"/>
++  <circle cx="12.5" cy="2.5" r="0.8" fill="#000"/>
++</svg>
+diff --git a/frontend/resources/images/cursors/disconnect.svg b/frontend/resources/images/cursors/disconnect.svg
+new file mode 100644
+index 0000000..0ff4cbe
+--- /dev/null
++++ b/frontend/resources/images/cursors/disconnect.svg
+@@ -0,0 +1,6 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">
++  <path d="M6.8 5.2L4.6 7.4a2.4 2.4 0 003.4 3.4l1.1-1.1" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
++  <path d="M9.2 10.8l2.2-2.2a2.4 2.4 0 00-3.4-3.4L6.9 6.3" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
++  <path d="M6.8 5.2L4.6 7.4a2.4 2.4 0 003.4 3.4l1.1-1.1" stroke="#000" stroke-width="1.4" stroke-linecap="round" fill="none"/>
++  <path d="M9.2 10.8l2.2-2.2a2.4 2.4 0 00-3.4-3.4L6.9 6.3" stroke="#000" stroke-width="1.4" stroke-linecap="round" fill="none"/>
++</svg>
+diff --git a/frontend/src/app/main/data/workspace/path.cljs b/frontend/src/app/main/data/workspace/path.cljs
+index 8948147..effbbad 100644
+--- a/frontend/src/app/main/data/workspace/path.cljs
++++ b/frontend/src/app/main/data/workspace/path.cljs
+@@ -23,6 +23,7 @@
+ ;; Edition
+ (dm/export edition/start-move-handler)
+ (dm/export edition/start-move-path-point)
++(dm/export edition/start-bend-point)
+ (dm/export edition/start-path-edit)
+ (dm/export edition/create-node-at-position)
+ (dm/export edition/move-selected)
+diff --git a/frontend/src/app/main/data/workspace/path/drawing.cljs b/frontend/src/app/main/data/workspace/path/drawing.cljs
+index 4caa229..2188e82 100644
+--- a/frontend/src/app/main/data/workspace/path/drawing.cljs
++++ b/frontend/src/app/main/data/workspace/path/drawing.cljs
+@@ -16,6 +16,7 @@
+    [app.common.types.shape :as cts]
+    [app.common.types.shape-tree :as ctst]
+    [app.common.types.shape.layout :as ctl]
++   [app.config :as cfg]
+    [app.main.data.helpers :as dsh]
+    [app.main.data.workspace.drawing.common :as dwdc]
+    [app.main.data.workspace.edition :as dwe]
+@@ -223,6 +224,16 @@
+        drag-events
+        (rx/of (finish-drag)))))))
+ 
++(defn- mod-held?
++  "True when the Cmd (macOS) / Ctrl (other) modifier is held on a mouse
++  event. While held in draw mode the pen acts as the bend tool (Figma):
++  empty-canvas gestures must not add nodes, and anchors/handles are
++  handled by the path editor instead."
++  [event]
++  (if (cfg/check-platform? :macos)
++    (boolean (.-meta event))
++    (boolean (.-ctrl event))))
++
+ (defn- start-edition
+   [_id]
+   (ptk/reify ::start-edition
+@@ -236,7 +247,11 @@
+       (let [mouse-down
+             (->> stream
+                  (rx/filter mse/mouse-event?)
+-                 (rx/filter mse/mouse-down-event?))
++                 (rx/filter mse/mouse-down-event?)
++                 ;; Holding Cmd temporarily turns the pen into the bend
++                 ;; tool: don't add nodes, let the editor points and
++                 ;; handlers own the gesture.
++                 (rx/filter (complement mod-held?)))
+ 
+             end-stream
+             (->> stream
+diff --git a/frontend/src/app/main/data/workspace/path/edition.cljs b/frontend/src/app/main/data/workspace/path/edition.cljs
+index d70fff5..32ebfcd 100644
+--- a/frontend/src/app/main/data/workspace/path/edition.cljs
++++ b/frontend/src/app/main/data/workspace/path/edition.cljs
+@@ -19,6 +19,7 @@
+    [app.main.data.workspace.path.selection :as selection]
+    [app.main.data.workspace.path.state :as st]
+    [app.main.data.workspace.path.streams :as streams]
++   [app.main.data.workspace.path.tools :as tools]
+    [app.main.data.workspace.path.undo :as undo]
+    [app.main.data.workspace.shapes :as dwsh]
+    [app.main.streams :as ms]
+@@ -287,6 +288,136 @@
+ 
+ (declare stop-path-edit)
+ 
++(defn modify-bend-handler
++  "Like modify-handler but mirrors both angle and length, so dragging one
++  handler from a corner pulls out symmetric handles (bend-drag)."
++  [id index prefix dx dy]
++  (ptk/reify ::modify-bend-handler
++    ptk/UpdateEvent
++    (update [_ state]
++      (let [content (st/get-path state :content)
++            modifiers (helpers/move-handler-modifiers content index prefix true true dx dy)
++            [cx cy] (if (= prefix :c1) [:c1x :c1y] [:c2x :c2y])
++            point (gpt/point (+ (dm/get-in content [index :params cx]) dx)
++                             (+ (dm/get-in content [index :params cy]) dy))]
++        (-> state
++            (update-in [:workspace-local :edit-path id :content-modifiers] merge modifiers)
++            (assoc-in [:workspace-local :edit-path id :moving-handler] point))))))
++
++(defn start-bend-drag
++  "Drag a corner point's handler symmetrically to pull out new handles.
++  Assumes the point already has handler entries (curve-to); if it is a
++  line-to corner, call make-curve first."
++  [position shift?]
++  (ptk/reify ::start-bend-drag
++    ptk/WatchEvent
++    (watch [_ state stream]
++      (let [id (dm/get-in state [:workspace-local :edition])
++            content (st/get-path state :content)
++            handlers (get (path/get-handlers content) position)
++            [index prefix] (first handlers)]
++        (if (some? index)
++          (let [cx (d/prefix-keyword prefix :x)
++                cy (d/prefix-keyword prefix :y)
++                modifiers (dm/get-in state [:workspace-local :edit-path id :content-modifiers])
++                start-delta-x (dm/get-in modifiers [index cx] 0)
++                start-delta-y (dm/get-in modifiers [index cy] 0)
++                points (path/get-points content)
++                point position
++                handler (path/get-handler-point content index prefix)
++                [op-idx op-prefix] (path/opposite-index content index prefix)
++                opposite (path/get-handler-point content op-idx op-prefix)]
++            (streams/drag-stream
++             (rx/concat
++              (rx/of (dwsh/update-shapes [id] path/convert-to-path)
++                     (selection/select-node position shift?))
++              (->> (streams/move-handler-stream handler point handler opposite points)
++                   (rx/map
++                    (fn [{:keys [x y shift?]}]
++                      (let [pos (cond-> (gpt/point x y)
++                                  shift? (path.helpers/position-fixed-angle point))]
++                        (modify-bend-handler
++                         id
++                         index
++                         prefix
++                         (+ start-delta-x (- (:x pos) (:x handler)))
++                         (+ start-delta-y (- (:y pos) (:y handler)))))))
++                   (rx/take-until
++                    (rx/merge
++                     (mse/drag-stopper stream)
++                     (->> stream
++                          (rx/filter streams/finish-edition?)))))
++              (rx/concat (rx/of (apply-content-modifiers))))))
++          ;; No handler entries (line-to corner that wasn't converted):
++          ;; fall back to moving the point itself.
++          (rx/of (start-move-path-point position shift?)))))))
++
++(defn prepare-bend-point
++  "Synchronously converts a straight (line-to) corner into a curve, so a
++  bend-drag that follows in the same stream is guaranteed handler entries
++  to work with. No-op when the point already has handlers. Runs as an
++  UpdateEvent (like split-segments' direct set-content), so the drag
++  observes converted content with no async gap; the drag-end
++  apply-content-modifiers commit covers the whole gesture."
++  [position]
++  (ptk/reify ::prepare-bend-point
++    ptk/UpdateEvent
++    (update [_ state]
++      (let [content (st/get-path state :content)
++            handlers (get (path/get-handlers content) position)]
++        (if (seq handlers)
++          state
++          (st/set-content state (-> content
++                                    (path/make-curve-point position)
++                                    (path/content))))))))
++
++(defn prepare-rebend-point
++  "Synchronously collapses a handled point's bezier handles back onto the
++  anchor (keeping :curve-to commands, unlike make-corner-point which may
++  revert segments to :line-to), so a bend-drag that follows in the same
++  stream pulls a fresh mirrored pair out from center. No-op when the point
++  has no handler entries. Same direct set-content pattern as
++  prepare-bend-point."
++  [position]
++  (ptk/reify ::prepare-rebend-point
++    ptk/UpdateEvent
++    (update [_ state]
++      (let [content (st/get-path state :content)
++            handler-refs (path/handler-indices content position)]
++        (if (empty? handler-refs)
++          state
++          (st/set-content state
++            (-> (reduce (fn [c [index prefix]]
++                          (let [[cx cy] (path.helpers/prefix->coords prefix)]
++                            (-> c
++                                (assoc-in [index :params cx] (:x position))
++                                (assoc-in [index :params cy] (:y position)))))
++                        (vec content)
++                        handler-refs)
++                (path/content))))))))
++
++(defn start-bend-point
++  "Cmd bend/mirror on an anchor (Figma):
++  - click toggles corner <-> curve (straight/mirrored),
++  - drag on a corner pulls out new symmetric handles,
++  - drag on a handled point collapses its handles and pulls a fresh
++    mirrored pair out from center (reset + pull in one gesture)."
++  [position shift? is-curve?]
++  (ptk/reify ::start-bend-point
++    ptk/WatchEvent
++    (watch [_ _ _]
++      (let [click-events (rx/of (if is-curve?
++                                  (tools/make-corner position)
++                                  (tools/make-curve position)))
++            drag-events (if is-curve?
++                          (rx/concat
++                           (rx/of (prepare-rebend-point position))
++                           (rx/of (start-bend-drag position shift?)))
++                          (rx/concat
++                           (rx/of (prepare-bend-point position))
++                           (rx/of (start-bend-drag position shift?))))]
++        (streams/drag-stream drag-events click-events)))))
++
+ 
+ (defn start-path-edit
+   [id]
+diff --git a/frontend/src/app/main/ui/css_cursors.cljs b/frontend/src/app/main/ui/css_cursors.cljs
+index 9c0a972..851c7c6 100644
+--- a/frontend/src/app/main/ui/css_cursors.cljs
++++ b/frontend/src/app/main/ui/css_cursors.cljs
+@@ -34,6 +34,7 @@
+   []
+   (let [style (css/create-style "css-cursors")]
+     ;; static
++    (init-static-cursor-style style "bend" cur/bend)
+     (init-static-cursor-style style "comments" cur/comments)
+     (init-static-cursor-style style "create-artboard" cur/create-artboard)
+     (init-static-cursor-style style "create-ellipse" cur/create-ellipse)
+diff --git a/frontend/src/app/main/ui/cursors.cljs b/frontend/src/app/main/ui/cursors.cljs
+index e618b60..46b2162 100644
+--- a/frontend/src/app/main/ui/cursors.cljs
++++ b/frontend/src/app/main/ui/cursors.cljs
+@@ -8,12 +8,14 @@
+   (:require-macros [app.main.ui.cursors :refer [cursor-ref cursor-fn collect-cursors]]))
+ 
+ ;; Static cursors
++(def ^:cursor bend (cursor-ref :bend 0 0 0))
+ (def ^:cursor comments (cursor-ref :comments 0 2 20))
+ (def ^:cursor create-artboard (cursor-ref :create-artboard))
+ (def ^:cursor create-ellipse (cursor-ref :create-ellipse))
+ (def ^:cursor create-polygon (cursor-ref :create-polygon))
+ (def ^:cursor create-rectangle (cursor-ref :create-rectangle))
+ (def ^:cursor create-shape (cursor-ref :create-shape))
++(def ^:cursor disconnect (cursor-ref :disconnect 0 0 0))
+ (def ^:cursor duplicate (cursor-ref :duplicate 0 0 0))
+ (def ^:cursor hand (cursor-ref :hand))
+ (def ^:cursor move-pointer (cursor-ref :move-pointer))
+diff --git a/frontend/src/app/main/ui/workspace/shapes/path/editor.cljs b/frontend/src/app/main/ui/workspace/shapes/path/editor.cljs
+index 34b00fa..6ce78bf 100644
+--- a/frontend/src/app/main/ui/workspace/shapes/path/editor.cljs
++++ b/frontend/src/app/main/ui/workspace/shapes/path/editor.cljs
+@@ -42,7 +42,7 @@
+ 
+ (mf/defc path-point*
+   {::mf/private true}
+-  [{:keys [position zoom edit-mode is-hover is-selected is-preview is-start-path is-last is-new is-curve]}]
++  [{:keys [position zoom edit-mode is-hover is-selected is-preview is-start-path is-last is-new is-curve mod-held?]}]
+   (let [{:keys [x y]} position
+ 
+         is-draw (= edit-mode :draw)
+@@ -81,20 +81,21 @@
+                   is-last
+                   (st/emit! (drp/reset-last-handler))
+ 
+-                  (and is-move is-mod (not is-curve))
+-                  (st/emit! (drp/make-curve position))
++                  ;; Figma-style bend/mirror: Cmd-click toggles corner and
++                  ;; curve in either mode; Cmd-drag on a corner pulls out
++                  ;; symmetric handles (click vs drag is decided inside
++                  ;; start-bend-point by the drag threshold).
++                  ^boolean is-mod
++                  (st/emit! (drp/start-bend-point position is-shift is-curve))
+ 
+-                  (and is-move is-mod is-curve)
+-                  (st/emit! (drp/make-corner position))
+-
+-                  is-move
++                  ^boolean is-move
+                   ;; If we're dragging a selected item we don't change the selection
+                   (st/emit! (drp/start-move-path-point position is-shift))
+ 
+-                  (and is-draw is-start-path)
++                  (and ^boolean is-draw ^boolean is-start-path)
+                   (st/emit! (drp/start-path-from-point position))
+ 
+-                  (and is-draw (not is-start-path))
++                  (and ^boolean is-draw (not ^boolean is-start-path))
+                   (st/emit! (drp/close-path-drag-start position)))))))]
+ 
+     [:g.path-point
+@@ -117,7 +118,11 @@
+                :on-pointer-enter on-enter
+                :on-pointer-leave on-leave
+                :pointer-events (when-not ^boolean is-preview "visible")
+-               :class (cond ^boolean is-draw (cur/get-static "pen-node")
++               :class (cond (or ^boolean is-new ^boolean is-preview)
++                            (cond ^boolean is-draw (cur/get-static "pen-node")
++                                  ^boolean is-move (cur/get-static "pointer-node"))
++                            ^boolean mod-held? (cur/get-static "bend")
++                            ^boolean is-draw (cur/get-static "pen-node")
+                             ^boolean is-move (cur/get-static "pointer-node"))
+                :style {:stroke-width 0
+                        :fill "none"}}]]))
+@@ -126,11 +131,15 @@
+ 
+ (mf/defc path-handler*
+   {::mf/private true}
+-  [{:keys [index prefix point handler zoom is-selected is-hover edit-mode snap-angle]}]
++  [{:keys [index prefix point handler zoom is-selected is-hover edit-mode snap-angle mod-held? alt-held?]}]
+   (let [x       (dm/get-prop handler :x)
+         y       (dm/get-prop handler :y)
+         is-draw (= edit-mode :draw)
+         is-move (= edit-mode :move)
++        ;; Cmd held in pen (draw) mode temporarily enables dragging
++        ;; points and handles (bend context); Option breaks symmetry.
++        is-interactive? (or ^boolean is-move
++                            (and ^boolean is-draw ^boolean mod-held?))
+ 
+         is-active
+         (or ^boolean is-selected
+@@ -148,16 +157,17 @@
+ 
+         on-pointer-down
+         (mf/use-fn
+-         (mf/deps index prefix is-move)
++         (mf/deps index prefix is-move is-draw)
+          (fn [event]
+-           (when (dom/left-mouse? event)
+-             (dom/stop-propagation event)
+-             (dom/prevent-default event)
+-
+-             (when ^boolean is-move
++           (let [is-mod-event? (kbd/mod? event)
++                 is-effective? (or ^boolean is-move
++                                   (and ^boolean is-draw ^boolean is-mod-event?))]
++             (when (and (dom/left-mouse? event) ^boolean is-effective?)
++               (dom/stop-propagation event)
++               (dom/prevent-default event)
+                (st/emit! (drp/start-move-handler index prefix))))))]
+ 
+-    [:g.handler {:pointer-events (if ^boolean is-draw "none" "visible")}
++    [:g.handler {:pointer-events (if ^boolean is-interactive? "visible" "none")}
+      [:line
+       {:x1 (:x point)
+        :y1 (:y point)
+@@ -194,8 +204,10 @@
+                :on-pointer-down on-pointer-down
+                :on-pointer-enter on-enter
+                :on-pointer-leave on-leave
+-               :class (when ^boolean is-move
+-                        (cur/get-static "pointer-move"))
++               :class (cond (and ^boolean is-interactive? ^boolean alt-held?)
++                            (cur/get-static "disconnect")
++                            ^boolean is-interactive?
++                            (cur/get-static "pointer-move"))
+                :style {:fill "none"
+                        :stroke-width 0}}]]))
+ 
+@@ -266,6 +278,8 @@
+   [{:keys [shape zoom state]}]
+   (let [hover-point   (mf/use-state nil)
+         editor-ref    (mf/use-ref nil)
++        mod-held?     (mf/use-state false)
++        alt-held?     (mf/use-state false)
+ 
+         {:keys [edit-mode
+                 drag-handler
+@@ -332,9 +346,20 @@
+     (hooks/use-stream
+      ms/mouse-position
+      (mf/deps base-content zoom)
+-     (fn [position]
+-       (when-let [point (path/closest-point base-content position (/ 0.01 zoom))]
+-         (reset! hover-point (when (< (gpt/distance position point) (/ 10 zoom)) point)))))
++      (fn [position]
++        (when-let [point (path/closest-point base-content position (/ 0.01 zoom))]
++          (reset! hover-point (when (< (gpt/distance position point) (/ 10 zoom)) point)))))
++
++    ;; Modifier feedback: holding Cmd over an anchor shows the bend cursor
++    ;; and enables bend/handle dragging; holding Option over a handle shows
++    ;; the disconnect cursor. Keyboard streams update on key down/up even
++    ;; without mouse movement.
++    (hooks/use-stream
++     ms/keyboard-mod
++     (fn [v] (reset! mod-held? (boolean v))))
++    (hooks/use-stream
++     ms/keyboard-alt
++     (fn [v] (reset! alt-held? (boolean v))))
+ 
+     [:g.path-editor {:ref editor-ref}
+      [:path {:d (.toString content)
+@@ -390,7 +415,7 @@
+              (boolean position-handlers)]
+ 
+          [:g.path-node {:key (dm/str pos-x "-" pos-y)}
+-          [:g.point-handlers {:pointer-events (when (= edit-mode :draw) "none")}
++          [:g.point-handlers {:pointer-events (when (and (= edit-mode :draw) (not @mod-held?)) "none")}
+            (for [[hindex prefix] position-handlers]
+              (let [handler-position  (path/get-handler-point content hindex prefix)
+                    handler-hover?    (contains? hover-handlers [hindex prefix])
+@@ -406,8 +431,10 @@
+                    :prefix prefix
+                    :zoom zoom
+                    :is-hover handler-hover?
+-                   :snap-angle (and moving-handler? matching-handler?)
+-                   :edit-mode edit-mode}])))]
++                    :snap-angle (and moving-handler? matching-handler?)
++                    :mod-held? @mod-held?
++                    :alt-held? @alt-held?
++                    :edit-mode edit-mode}])))]
+ 
+           [:> path-point* {:position position
+                            :zoom zoom
+@@ -415,8 +442,9 @@
+                            :is-selected point-selected?
+                            :is-hover point-hover?
+                            :is-last is-last
+-                           :is-start-path is-path-start
+-                           :is-curve is-curve}]]))
++                            :is-start-path is-path-start
++                            :mod-held? @mod-held?
++                            :is-curve is-curve}]]))
+ 
+      (when (and prev-handler last-p)
+        [:g.prev-handler {:pointer-events "none"}
+diff --git a/frontend/src/app/main/ui/workspace/viewport/utils.cljs b/frontend/src/app/main/ui/workspace/viewport/utils.cljs
+index 7858a07..8a111ab 100644
+--- a/frontend/src/app/main/ui/workspace/viewport/utils.cljs
++++ b/frontend/src/app/main/ui/workspace/viewport/utils.cljs
+@@ -24,6 +24,8 @@
+   (case cursor
+     :hand (cur/get-static "hand")
+     :comments (cur/get-static "comments")
++    :bend (cur/get-static "bend")
++    :disconnect (cur/get-static "disconnect")
+     :create-artboard (cur/get-static "create-artboard")
+     :create-rectangle (cur/get-static "create-rectangle")
+     :create-ellipse (cur/get-static "create-ellipse")

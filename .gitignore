@@ -1,0 +1,16 @@
+# Generated locally by scripts/setup.sh — never commit these.
+conf/secret
+conf/session-token
+conf/nginx-auth.conf
+conf/local-account
+conf/penpot.env
+
+# Extracted app binaries, user data, runtime state.
+app/
+data/
+logs/
+run/
+dl/
+
+*.log
+.DS_Store

@@ -1,0 +1,139 @@
+#!/bin/bash
+# Penpot Local: runs a Penpot server natively on macOS (no Docker).
+#   penpot-local watch                      (run by launchd at login)
+#   penpot-local start | stop | restart | status | logs
+#
+# `watch` keeps nginx and valkey up (a few MB) and starts the backend and
+# exporter only while Penpot.app is open, stopping them IDLE_STOP seconds
+# after it quits. PostgreSQL is the existing Homebrew postgresql@15 service.
+
+set -u
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+ROOT="$HOME/Library/PenpotLocal"
+RUN="$ROOT/run"
+LOGS="$ROOT/logs"
+READY="$RUN/ready"
+IDLE_STOP=30
+
+set -a
+. "$ROOT/conf/penpot.env"
+set +a
+
+mkdir -p "$RUN/nginx" "$RUN/tmp" "$LOGS" "$ROOT/data/assets"
+
+log() { echo "$(date '+%F %T') $*" >>"$LOGS/watch.log"; }
+
+pid_alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
+
+backend_ready() { curl -sf -o /dev/null "http://127.0.0.1:6060/readyz"; }
+
+penpot_app_open() { pgrep -f "/Contents/MacOS/Penpot Desktop$" >/dev/null; }
+
+start_one() { # name command...
+  local name=$1; shift
+  if pid_alive "$name"; then return 0; fi
+  nohup "$@" >"$LOGS/$name.log" 2>&1 &
+  echo $! >"$RUN/$name.pid"
+}
+
+stop_one() {
+  local name=$1
+  if pid_alive "$name"; then
+    kill "$(cat "$RUN/$name.pid")" 2>/dev/null
+    for _ in $(seq 1 40); do pid_alive "$name" || break; sleep 0.25; done
+    pid_alive "$name" && kill -9 "$(cat "$RUN/$name.pid")" 2>/dev/null
+  fi
+  rm -f "$RUN/$name.pid"
+}
+
+start_light() {
+  start_one valkey valkey-server "$ROOT/conf/valkey.conf"
+  start_one nginx nginx -c "$ROOT/conf/nginx.conf"
+}
+
+start_heavy() {
+  if ! pg_isready -q -h 127.0.0.1 -p 5432; then
+    echo "PostgreSQL is not running. Start it with: brew services start postgresql@15" >&2
+    return 1
+  fi
+  (cd "$ROOT/app/backend" && start_one backend /bin/bash run.sh)
+  # The exporter reads the same PENPOT_HTTP_SERVER_PORT variable as the backend.
+  (cd "$ROOT/app/exporter" && PENPOT_HTTP_SERVER_PORT=6061 start_one exporter node app.js)
+}
+
+stop_heavy() {
+  rm -f "$READY"
+  stop_one exporter
+  stop_one backend
+}
+
+start() {
+  start_light
+  start_heavy || exit 1
+  for _ in $(seq 1 240); do backend_ready && break; sleep 0.5; done
+  if ! backend_ready; then
+    echo "backend did not become ready; see $LOGS/backend.log" >&2
+    exit 1
+  fi
+  touch "$READY"
+  echo "Penpot Local is running at $PENPOT_PUBLIC_URI"
+}
+
+stop() {
+  stop_heavy
+  stop_one nginx
+  stop_one valkey
+  echo "Penpot Local stopped"
+}
+
+watch() {
+  trap 'stop >/dev/null; exit 0' TERM INT
+  log "watch started"
+  start_light
+  local idle=0
+  while true; do
+    if penpot_app_open; then
+      idle=0
+      if ! pid_alive backend; then
+        log "Penpot opened: starting backend and exporter"
+        start_heavy || log "could not start: PostgreSQL is not running"
+      fi
+      if [ ! -f "$READY" ] && backend_ready; then
+        touch "$READY"
+        log "backend ready"
+      fi
+    elif pid_alive backend; then
+      idle=$((idle + 2))
+      if [ "$idle" -ge "$IDLE_STOP" ]; then
+        log "Penpot closed: stopping backend and exporter"
+        stop_heavy
+        idle=0
+      fi
+    fi
+    pid_alive backend || rm -f "$READY"
+    pid_alive nginx && pid_alive valkey || start_light
+    sleep 2 &
+    wait $!
+  done
+}
+
+status() {
+  local name
+  for name in valkey nginx backend exporter; do
+    if pid_alive "$name"; then
+      printf '%-9s running  %s MB\n' "$name" "$(ps -o rss= -p "$(cat "$RUN/$name.pid")" | awk '{printf "%d", $1/1024}')"
+    else
+      printf '%-9s stopped\n' "$name"
+    fi
+  done
+}
+
+case "${1:-}" in
+  watch) watch ;;
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  logs) tail -n 50 "$LOGS"/*.log ;;
+  *) echo "usage: penpot-local watch|start|stop|restart|status|logs" >&2; exit 2 ;;
+esac

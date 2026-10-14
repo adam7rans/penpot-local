@@ -1,0 +1,17 @@
+# Auto-login: every request from Penpot itself is signed in as the single
+# local account via a Penpot access token. Requests coming from other
+# websites (cross-site, or a foreign Origin) get no token.
+map "$http_sec_fetch_site:$http_origin" $penpot_local_auth {
+    default                              "";
+    "~^cross-site:"                      "";
+    "~^[a-z-]*:$"                       "Bearer __SESSION_TOKEN__";
+    "~^[a-z-]*:http://localhost:9001$"  "Bearer __SESSION_TOKEN__";
+    "~^[a-z-]*:http://127.0.0.1:9001$"  "Bearer __SESSION_TOKEN__";
+}
+
+# The exporter refuses requests without an auth-token cookie; give it a
+# placeholder only when the request qualified for the token above.
+map $penpot_local_auth $penpot_export_cookie {
+    ""       "";
+    default  "auth-token=penpot-local";
+}

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Starting Penpot…</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px;
+    background: #18181a; color: #aab5ba;
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Work Sans", sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  .spinner {
+    width: 32px; height: 32px; border-radius: 50%;
+    border: 3px solid #2e3434; border-top-color: #00d1b8;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-color-scheme: light) {
+    body { background: #ffffff; color: #495e74; }
+    .spinner { border-color: #e8eaee; border-top-color: #00d1b8; }
+  }
+</style>
+</head>
+<body>
+<div class="spinner" role="progressbar" aria-label="Starting Penpot"></div>
+<div>Starting Penpot…</div>
+<script>
+  (function poll() {
+    fetch("/readyz", { cache: "no-store" })
+      .then(function (r) { return r.ok ? location.reload() : setTimeout(poll, 1000); })
+      .catch(function () { setTimeout(poll, 1000); });
+  })();
+</script>
+</body>
+</html>
